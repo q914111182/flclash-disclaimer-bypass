@@ -1,0 +1,250 @@
+name: kss-packages
+
+on:
+  push:
+    branches:
+      - kss
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kss-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: "3.47.6"
+  GO_VERSION: "1.27.1"
+  NDK_VERSION: r28c
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: android-arm64-v8a
+            os: ubuntu-latest
+            platform: android
+            setup_args: android --arch arm64 --targets apk --env stable -v
+            out: android-arm64-v8a.apk
+            macos_arch: ""
+          - name: windows-amd64
+            os: windows-2022
+            platform: windows
+            setup_args: windows --targets zip --env stable -v
+            out: windows-amd64.zip
+            macos_arch: ""
+          - name: macos-arm64
+            os: macos-latest
+            platform: macos
+            setup_args: macos --targets dmg --env stable -v
+            out: macos-arm64.dmg
+            macos_arch: arm64
+          - name: macos-amd64
+            os: macos-15-intel
+            platform: macos
+            setup_args: macos --targets dmg --env stable -v
+            out: macos-amd64.dmg
+            macos_arch: amd64
+    env:
+      OUT_NAME: ${{ matrix.out }}
+    steps:
+      - name: Use HTTPS for GitHub submodules
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Rust
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          if [ -f "$HOME/.cargo/env" ]; then
+            # shellcheck disable=SC1090
+            . "$HOME/.cargo/env"
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup show
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Setup Java
+        if: matrix.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        if: matrix.platform == 'android'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup NDK
+        if: matrix.platform == 'android'
+        uses: nttld/setup-ndk@v1
+        id: build-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Setup Xcode
+        if: matrix.platform == 'macos'
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app \
+            || sudo xcode-select -s /Applications/Xcode_26.2.app \
+            || sudo xcode-select -s /Applications/Xcode_26.1.app \
+            || sudo xcode-select -s /Applications/Xcode.app \
+            || true
+          xcodebuild -version
+
+      - name: Enable git long paths
+        if: matrix.platform == 'windows'
+        run: git config --global core.longpaths true
+
+      - name: Disable Impeller on Intel macOS
+        if: matrix.macos_arch == 'amd64'
+        run: plutil -replace FLTEnableImpeller -bool NO macos/Runner/Info.plist
+
+      - name: Fetch CA certificates
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+          else
+            echo "$CA_BUNDLE_SHA256  $bundle" | shasum -a 256 -c -
+          fi
+
+      - name: Create Android release keystore
+        if: matrix.platform == 'android'
+        run: |
+          keytool -genkeypair -keystore android/app/keystore.jks -alias kss \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass kssclash -keypass kssclash \
+            -dname "CN=KSS, OU=KSS, O=KSS, L=Tokyo, ST=Tokyo, C=JP"
+          mkdir -p android
+          {
+            echo "keyAlias=kss"
+            echo "storePassword=kssclash"
+            echo "keyPassword=kssclash"
+          } >> android/local.properties
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Package
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+        run: dart setup.dart ${{ matrix.setup_args }}
+
+      - name: Verify Android application id
+        if: matrix.platform == 'android'
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys, zipfile
+          apks = list(pathlib.Path("dist").rglob("*.apk"))
+          if not apks:
+              sys.exit("no apk")
+          data = zipfile.ZipFile(apks[0]).read("AndroidManifest.xml")
+          def has(text):
+              raw = text.encode()
+              utf16 = text.encode("utf-16le")
+              return raw in data or utf16 in data
+          if not has("com.kss.clash"):
+              sys.exit("com.kss.clash missing from manifest")
+          if has("com.kss.clash.dev"):
+              sys.exit("release apk has .dev applicationId suffix")
+          for action in ("com.kss.clash.action.START", "com.kss.clash.action.STOP", "com.kss.clash.action.TOGGLE"):
+              if not has(action):
+                  sys.exit(f"missing {action}")
+          print("android package id verified", apks[0])
+          PY
+
+      - name: Collect renamed package
+        run: |
+          mkdir -p upload
+          src=""
+          size=0
+          while IFS= read -r -d '' f; do
+            s=$(wc -c < "$f" | tr -d ' ')
+            if [ "$s" -gt "$size" ]; then
+              size=$s
+              src=$f
+            fi
+          done < <(find dist -type f \( -name '*.apk' -o -name '*.dmg' -o -name '*.zip' \) -print0)
+          if [ -z "$src" ]; then
+            echo "dist tree:"
+            find dist -type f | sort
+            exit 1
+          fi
+          cp "$src" "upload/$OUT_NAME"
+          echo "packed $src -> upload/$OUT_NAME ($size bytes)"
+          ls -lh "upload/$OUT_NAME"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: upload/${{ matrix.out }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: packages
+          pattern: "*"
+          merge-multiple: true
+
+      - name: List packages
+        run: |
+          find packages -type f -exec ls -lh {} \;
+          for f in windows-amd64.zip macos-arm64.dmg macos-amd64.dmg android-arm64-v8a.apk; do
+            test -f "packages/$f" || { echo "missing $f"; find packages; exit 1; }
+          done
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kss-v0.9.1
+          name: KSS-FlClash 0.9.1
+          overwrite_files: true
+          body: |
+            KSS 修改版 FlClash 0.9.1
+
+            - 新安装跳过首次免责声明和对照输入承诺
+            - 已屏蔽应用自动检查更新
+            - 应用名称：KSS-FlClash
+            - Android 包名：com.kss.clash（支持 com.kss.clash.action.START / STOP / TOGGLE）
+          files: packages/*
