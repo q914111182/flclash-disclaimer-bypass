@@ -1,0 +1,189 @@
+name: kss-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: "3.47.6"
+  GO_VERSION: "1.27.1"
+  NDK_VERSION: r28c
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: android
+            os: ubuntu-latest
+            arch: arm64
+            extra: --arch arm64
+          - platform: windows
+            os: Windows-2022
+            arch: amd64
+            extra: --targets zip
+          - platform: macos
+            os: macos-15-intel
+            arch: amd64
+            extra: ""
+          - platform: macos
+            os: macos-latest
+            arch: arm64
+            extra: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Android Signing
+        if: matrix.platform == 'android'
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 --decode > android/app/keystore.jks
+            {
+              echo "keyAlias=${KEY_ALIAS}"
+              echo "storePassword=${STORE_PASSWORD}"
+              echo "keyPassword=${KEY_PASSWORD}"
+            } >> android/local.properties
+          fi
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup Gradle
+        if: matrix.platform == 'android'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Enable git long paths (Windows)
+        if: matrix.platform == 'windows'
+        run: git config --global core.longpaths true
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Setup Xcode
+        if: matrix.platform == 'macos'
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.3.app || sudo xcode-select -s /Applications/Xcode_26.2.app || sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Setup NDK
+        if: matrix.platform == 'android'
+        uses: nttld/setup-ndk@v1
+        id: build-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Get Flutter Dependency
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Disable Impeller on Intel macOS
+        if: matrix.platform == 'macos' && matrix.arch == 'amd64'
+        run: plutil -replace FLTEnableImpeller -bool NO macos/Runner/Info.plist
+
+      - name: Fetch CA certificates
+        shell: bash
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+          else
+            echo "$CA_BUNDLE_SHA256  $bundle" | shasum -a 256 -c -
+          fi
+
+      - name: Setup
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+        run: dart setup.dart ${{ matrix.platform }} --env stable ${{ matrix.extra }} -v
+
+      - name: Name packages
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          py=python3
+          command -v python3 >/dev/null 2>&1 || py=python
+          "$py" - << 'PY'
+          import os, shutil, sys
+          platform = os.environ["PLATFORM"]
+          arch = os.environ["ARCH"]
+          found = []
+          for root, dirs, files in os.walk("dist"):
+              for name in files:
+                  if name.endswith((".zip", ".dmg", ".apk")):
+                      found.append(os.path.join(root, name))
+          print("found:")
+          print("\n".join(found) or "(none)")
+          if not found:
+              sys.exit("no package produced under dist/")
+          os.makedirs("release-out", exist_ok=True)
+          if platform == "windows":
+              src = next(path for path in found if path.endswith(".zip"))
+              dst = "release-out/windows-amd64.zip"
+          elif platform == "macos":
+              src = next(path for path in found if path.endswith(".dmg"))
+              dst = f"release-out/macos-{arch}.dmg"
+          else:
+              apks = [path for path in found if path.endswith(".apk")]
+              arm = [path for path in apks if "arm64" in path]
+              src = (arm or apks)[0]
+              dst = "release-out/android-arm64-v8a.apk"
+          shutil.copy2(src, dst)
+          print(f"copied {src} -> {dst}")
+          PY
+          ls -lh release-out
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: kss-${{ matrix.platform }}-${{ matrix.arch }}
+          path: release-out/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          pattern: kss-*
+          merge-multiple: true
+
+      - name: List
+        run: find bundles -type f -exec ls -lh {} \;
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bundles/*
+          generate_release_notes: true
